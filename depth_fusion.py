@@ -69,11 +69,17 @@ def iproj(pose, K, u, v, depth):
     Xw = Rwc.dot(Xc) + twc
     return Xw
 
-def makeJacobian(u, v, d, K):
-    #Xw(u, v, d) = Xw(ui, vi, di) + Ji(u-ui, v-vi, d-di)
+def makeJacobian(u, v, Z, K):
+    #P(u, v, Z) = P(ui, vi, Zi) + Ji(u-ui, v-vi, Z-Zi)
+    #P = [X, Y, Z]
+    # X = Z*(u - cx)/fx
+    # Y = Z*(v - cy)/fy
+    #Ji = [dX/du, dX/dv, dX/dZ,
+    #      dY/du, dY/dv, dY/dZ,
+    #      dZ/du, dZ/dv, dZ/dZ]
     fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
-    J = np.array([[d/fx, 0, (u-cx)/fx],
-                  [0, d/fy, (v-cy)/fy],
+    J = np.array([[Z/fx, 0, (u-cx)/fx],
+                  [0, Z/fy, (v-cy)/fy],
                   [0, 0, 1]])
     return J
 
