@@ -5,10 +5,12 @@ import numpy as np
 import os
 import re
 import pylab as plt
+import sys
 from tqdm import tqdm
 import open3d as o3d
 import quaternion
 from numpy.linalg import inv
+import numba as nu
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -44,16 +46,23 @@ def load_poses(path):
     f.close()
     return img_name_poses_map
 
-def proj(global_map, pose, K):
+def projFromMap(map, pose, K): #map save 3D points with world coordinate
     fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
-    for i in range(len(global_map)):
+    for i in range(len(map)):
         Rcw, tcw = pose[0], pose[1]
-        landmark = global_map[i]
+        landmark = map[i]
         Xc = Rcw.dot(landmark) + tcw
 
         u_proj = fx * Xc[0] / Xc[2] + cx
         v_proj = fy * Xc[1] / Xc[2] + cy
-        yield i, round(u_proj), round(v_proj)
+        yield i, round(u_proj), round(v_proj), Xc[2]
+
+def getDepth(pose, K, Xw):
+    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+    Rcw, tcw = pose[0], pose[1]
+
+    Xc = Rcw.dot(Xw) + tcw
+    return Xc[2]
 
 def iproj(pose, K, u, v, depth):
     fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
@@ -83,36 +92,23 @@ def makeJacobian(u, v, Z, K):
                   [0, 0, 1]])
     return J
 
-def makeQ(depth):
-    mvInvLevelSigma2 = np.ones(8)
-    mvLevelSigma2 = np.ones(8)
-    mvScaleFactor = np.ones(8)
-    mvInvScaleFactor = np.ones(8)
-
-    max_depth = 10
-
-    for i in range(1, 8):
-        mvScaleFactor[i] = mvScaleFactor[i - 1] * 1.2
-        mvLevelSigma2[i] = mvScaleFactor[i] * mvScaleFactor[i]
-
-    for i in range(8):
-        mvInvScaleFactor[i] = 1.0 / mvScaleFactor[i]
-        mvInvLevelSigma2[i] = 1.0 / mvLevelSigma2[i]
-
-    level = round(depth * 7 / max_depth)
-
-
-    Q = mvLevelSigma2[level] * np.identity(3)
-
+def makeQ(depth, baseline, K):
+    bf = K[0, 0] * baseline
+    sigma_d = 0.5
+    sigma_z = sigma_d * depth**2/bf
+    sigma_z2 = sigma_z**2
+    sigma2 = np.array([0.25, 0.25, sigma_z2])
+    Q = np.diag(sigma2)
     return Q
 
-def computeU(u, v ,depth, K, pose):
+def computeU(u, v ,depth, K, baseline, pose):
     J = makeJacobian(u, v, depth, K)
-    Q = makeQ(depth)
+    Jt = np.transpose(J)
+    Q = makeQ(depth, baseline, K)
     Rcw = pose[0]
     Rwc = np.transpose(Rcw)
 
-    U_obs = np.linalg.multi_dot([Rwc, J, Q, J.T, Rwc.T])
+    U_obs = np.linalg.multi_dot([Rwc, J, Q, Jt, Rcw])
 
     return U_obs
 
@@ -153,6 +149,23 @@ def read_pipeline_depth_maps(path):
     data = np.flipud(data)
     return data, shape
 
+def write_depth_map(data, fpath, scale=1, file_identifier=b'Pf', dtype="float32"):
+    data = np.flipud(data)
+    height, width = np.shape(data)[:2]
+    values = np.ndarray.flatten(np.asarray(data, dtype=dtype))
+    endianess = data.dtype.byteorder
+    # print(endianess)
+
+    if endianess == '<' or (endianess == '=' and sys.byteorder == 'little'):
+        scale *= -1
+
+    with open(fpath, 'wb') as file:
+        file.write((file_identifier))
+        file.write(('\n%d %d\n' % (width, height)).encode())
+        file.write(('%d\n' % scale).encode())
+
+        file.write(values)
+
 def read_colmap_depth_maps(path):
     with open(path, "rb") as fid:
         width, height, channels = np.genfromtxt(fid, delimiter="&", max_rows=1,
@@ -181,8 +194,12 @@ def kf_depth_fusion(X_prior, X_obs, U_prior, U_obs):
     U_post = U_prior - Wi.dot(U_prior)
     return X_post, U_post
 
-def compare_raw_depth_maps(tgt_folder, pipeline_depth_map_paths, pipeline_depth_map_names):
-    stats_file = os.path.join(args.output_path, "evaluation_raw_depth_maps.txt")
+def compare_depth_maps(tgt_folder, depth_map_folder, pipeline_depth_map_names, flag = "raw"):
+    if flag == "raw":
+        stats_file = os.path.join(args.output_path, "evaluation_raw_depth_maps.txt")
+    else:
+        stats_file = os.path.join(args.output_path, "evaluation_fused_depth_maps.txt")
+
     global_min_mae = 100.0
     global_max_mae = 0.0
     maes = []
@@ -195,7 +212,7 @@ def compare_raw_depth_maps(tgt_folder, pipeline_depth_map_paths, pipeline_depth_
         # depth maps
         colmap_depth_map = read_colmap_depth_maps(colmap_depth_map_path)
 
-        pipline_depth_map_path = pipeline_depth_map_paths[i]
+        pipline_depth_map_path = depth_map_folder + pipeline_depth_map_names[i] + '.pfm'
         pipeline_depth_map, _ = read_pipeline_depth_maps(pipline_depth_map_path)
 
         both_non_zeros = (pipeline_depth_map != 0) & (colmap_depth_map != 0)
@@ -227,65 +244,6 @@ def compare_raw_depth_maps(tgt_folder, pipeline_depth_map_paths, pipeline_depth_
             global_min_mae, np.median(medians), weighted_average_mae, global_max_mae))
     f.close()
 
-def compare_fused_depth_maps(tgt_folder, img_SE3_map, K, pipeline_depth_map_names, global_map):
-    stats_file = os.path.join(args.output_path, "evaluation_fused_depth_maps.txt")
-    global_min_mae = 100.0
-    global_max_mae = 0.0
-    maes = []
-    medians = []
-    num_pixels = []
-    total_both_no_zeros_pixels = 0
-    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
-
-    for i in tqdm(range(len(pipeline_depth_map_names)), desc="Loading and comparing fused depth maps", unit="depth maps"):
-        colmap_depth_map_path = tgt_folder + pipeline_depth_map_names[i] +'.png.geometric.bin'
-        # depth maps
-        colmap_depth_map = read_colmap_depth_maps(colmap_depth_map_path)
-
-        pipeline_fused_depth_map = np.zeros((600, 800))
-        # pipeline's 3D model
-        for point in global_map:
-            Rcw = img_SE3_map[pipeline_depth_map_names[i]][0]
-            tcw = img_SE3_map[pipeline_depth_map_names[i]][1]
-            Xc = Rcw.dot(point) + tcw
-            if Xc[2] <= 0:
-                continue
-            u_proj = fx * Xc[0] / Xc[2] + cx
-            v_proj = fy * Xc[1] / Xc[2] + cy
-            u_proj, v_proj = round(u_proj), round(v_proj)
-
-            if u_proj < 0 or u_proj >= 800 or v_proj < 0 or v_proj >= 600:
-                continue
-            pipeline_fused_depth_map[v_proj, u_proj] = Xc[2]
-
-        both_non_zeros = (pipeline_fused_depth_map != 0) & (colmap_depth_map != 0)
-        both_zeros = (pipeline_fused_depth_map == 0) & (colmap_depth_map == 0)
-        if np.sum(both_non_zeros) == 0:
-            continue
-        median = np.median(np.absolute(pipeline_fused_depth_map[both_non_zeros] - colmap_depth_map[both_non_zeros]))
-        medians.append(median)
-        mae = np.mean(np.absolute(pipeline_fused_depth_map[both_non_zeros] - colmap_depth_map[both_non_zeros]))
-        maes.append(mae)
-
-        global_min_mae = min(mae, global_min_mae)
-        global_max_mae = max(mae, global_max_mae)
-
-        N_both_non_zeros = np.sum(both_non_zeros)
-        num_pixels.append(N_both_non_zeros)
-        total_both_no_zeros_pixels += N_both_non_zeros
-
-    weighted_average_mae = 0.0
-    with open(stats_file, 'w') as f:
-        for i in range(len(maes)):
-            f.write("No.{0} \n".format(i))
-            f.write("MAE: {0} over {1} pixels \n".format(maes[i], num_pixels[i]))
-            f.write("Median of error: {0} over {1} pixels \n".format(medians[i], num_pixels[i]))
-            weighted_average_mae += (maes[i]*(num_pixels[i]/total_both_no_zeros_pixels))
-            f.write(
-                "=====================================================================================================\n")
-        f.write("Minimum MAE: {0}, Median Medians: {1}, weighted average of MAE {2}, Maximum MAE: {3}\n".format(global_min_mae, np.median(medians), weighted_average_mae,global_max_mae))
-    f.close()
-
 if __name__ == "__main__":
     args = parse_args()
     print(args)
@@ -304,6 +262,7 @@ if __name__ == "__main__":
     # Read depth/normal maps from folder
     if dataset == "FLORIDA":
         K = np.array([[595.58148, 0, 380.47882], [0, 593.81262, 302.91428], [0, 0, 1]])
+        baseline = 0.13893691714566
     elif dataset == "MEXICO":
         K = np.array([[600.8175, 0, 383.27002], [0, 600.82904, 287.87112], [0, 0, 1]])
     elif dataset == 'STAVRONIKITA':
@@ -316,64 +275,90 @@ if __name__ == "__main__":
     img_name_SE3 = load_poses(args.src_poses_path)
     assert (len(img_name_SE3) == len(pipeline_depth_map_names))
 
-    global_map = []
-    global_uncertainties = []
+    prev_map = []
+    prev_uncertainties = []
 
-    pipeline_depth_map_names = pipeline_depth_map_names[0:5]
-
-    for i in tqdm(range(len(pipeline_depth_map_names)), desc="Start to depth fusion & a build map", unit="depth maps"):
+    pipeline_depth_map_names = pipeline_depth_map_names[0:10]
+    for i in tqdm(range(0, len(pipeline_depth_map_names)), desc="Start to depth fusion & a build map", unit="depth maps"):
         pipline_depth_map_path = pipeline_depth_map_paths[i]
         pipeline_depth_map, shape = read_pipeline_depth_maps(pipline_depth_map_path)
         pose = img_name_SE3[pipeline_depth_map_names[i]]
 
         height, width = shape[0], shape[1]
-        if len(global_map) == 0:
+        if i == 0:
             for v in range(0, height):
                 for u in range(0, width):
                     depth = pipeline_depth_map[v, u]
                     if depth <= 0:
                         continue
                     X_obs = iproj(pose, K, u, v, depth)
-                    global_map.append(X_obs)
-                    U_obs = computeU(u, v, depth, K, pose)
-                    global_uncertainties.append(U_obs)
+                    prev_map.append(X_obs)
+                    U_obs = computeU(u, v, depth, K, baseline, pose)
+                    prev_uncertainties.append(U_obs)
         else:
-            t_map = []
-            t_uncertainties = []
+            cur_map = []
+            cur_uncertainties = []
             visited = np.zeros((height, width), dtype=bool)
-            for (id, u_proj, v_proj) in proj(global_map, pose, K):
+            for (id, u_proj, v_proj, depth_prior) in projFromMap(prev_map, pose, K):
                 if u_proj < 0 or u_proj >= width or v_proj < 0 or v_proj >= height:
                     continue
-                depth = pipeline_depth_map[v_proj, u_proj]
-                if depth <= 0 or visited[v_proj, u_proj]:
+                depth_obs = pipeline_depth_map[v_proj, u_proj]
+                if depth_obs <= 0 or visited[v_proj, u_proj]:
                     continue
-                visited[v_proj, u_proj] = True
 
-                X_obs = iproj(pose, K, u_proj, v_proj, depth)
-                U_obs = computeU(u_proj, v_proj, depth, K, pose)
-                U_prior = global_uncertainties[id]
-                X_prior = global_map[id]
+
+                # bf = K[0, 0] * baseline
+                # sigma_d = 0.5
+                # th = sigma_d * depth_prior**2/bf
+                # if abs(depth_obs - depth_prior) > th:
+                #     continue
+
+                X_obs = iproj(pose, K, u_proj, v_proj, depth_obs)
+                U_obs = computeU(u_proj, v_proj, depth_obs, K, baseline, pose)
+
+                U_prior = prev_uncertainties[id]
+                X_prior = prev_map[id]
+
+                lamda = np.linalg.eig(U_prior)
+                index = np.argmax(lamda[0])
+                max_eigenval = np.real(lamda[0][index])
+
+                if abs(X_prior[2] - X_obs[2]) > np.sqrt(max_eigenval):
+                    continue
+
+                visited[v_proj, u_proj] = True
+                # Update by Kalman filter
                 X_post, U_post = kf_depth_fusion(X_prior, X_obs, U_prior, U_obs)
+                depth_post = getDepth(pose, K, X_post)
+
+                pipeline_depth_map[v_proj, u_proj] = depth_post
                 # update 3D position and uncertainty
-                global_map[id] = X_post
-                global_uncertainties[id] = U_post
+                cur_map.append(X_post)
+                cur_uncertainties.append(U_post)
             # add rest of pixel's 3D position into map
             for v in range(0, height):
                 for u in range(0, width):
-                    if visited[v, u]:
+                    depth_obs = pipeline_depth_map[v, u]
+                    if visited[v, u] or depth_obs <= 0:
                         continue
-                    X_obs = iproj(pose, K, u_proj, v_proj, depth)
-                    U_obs = computeU(u_proj, v_proj, depth, K, pose)
-                    t_map.append(X_obs)
-                    t_uncertainties.append(U_obs)
 
-            global_map.extend(t_map)
-            global_uncertainties.extend(t_uncertainties)
-        # print("Complete depth map {0}:{1}".format(i, pipeline_depth_map_names[i]))
+                    X_obs = iproj(pose, K, u, v, depth_obs)
+                    U_obs = computeU(u, v, depth_obs, K, baseline, pose)
+                    cur_map.append(X_obs)
+                    cur_uncertainties.append(U_obs)
+
+            prev_map = cur_map
+            prev_uncertainties = cur_uncertainties
+
+        save_path = args.output_path + "kf_depth_maps/" + pipeline_depth_map_names[i] + ".pfm"
+        write_depth_map(pipeline_depth_map, save_path)
+
+    # print("Complete depth map {0}:{1}".format(i, pipeline_depth_map_names[i]))
 
     # Evaluate depth maps
-    compare_raw_depth_maps(args.gt_folder, pipeline_depth_map_paths, pipeline_depth_map_names)
-    compare_fused_depth_maps(args.gt_folder, img_name_SE3, K, pipeline_depth_map_names, global_map)
+    compare_depth_maps(args.gt_folder, args.src_folder, pipeline_depth_map_names)
+    fused_depth_folder = args.output_path + "kf_depth_maps/"
+    compare_depth_maps(args.gt_folder, fused_depth_folder, pipeline_depth_map_names, "fused")
 
     # Pass global_map to Open3D.o3d.geometry.PointCloud and visualize
     # pcd = o3d.geometry.PointCloud()
