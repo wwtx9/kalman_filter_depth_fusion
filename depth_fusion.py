@@ -29,26 +29,6 @@ def parse_args():
     args = parser.parse_args()
     return args
 
-# load poses from underwater dataset
-# def load_poses(path):
-#     f = open(path, "r")
-#     lines = f.readlines()
-#     img_name_poses_map = {}
-#
-#     for line in lines:
-#         tokens = line.split(" ")
-#         timestamp = tokens[0]
-#         timestamp_tokens = timestamp.split(".")
-#         img_name = timestamp_tokens[0]+timestamp_tokens[1]
-#         twc = np.array([np.float64(tokens[1]), np.float64(tokens[2]), np.float64(tokens[3])])
-#         qwc = np.quaternion(np.float64(tokens[7]), np.float64(tokens[4]), np.float64(tokens[5]), np.float64(tokens[6]))
-#         Rwc = quaternion.as_rotation_matrix(qwc)
-#         Rcw = np.transpose(Rwc)
-#         tcw = -Rcw.dot(twc)
-#         img_name_poses_map[img_name] = (Rcw, tcw)
-#     f.close()
-#     return img_name_poses_map
-
 # load poses from Virtual Kitti 2
 def load_poses(path, isLeft):
     f = open(path, "r")
@@ -71,6 +51,7 @@ def load_poses(path, isLeft):
 
         Rcw = np.array([[r11, r12, r13], [r21, r22, r23], [r31, r32, r33]])
         tcw = np.array([t1, t2, t3])
+
         img_name_poses_map[img_name] = (Rcw, tcw)
     f.close()
     return img_name_poses_map
@@ -235,7 +216,7 @@ def kf_depth_fusion(X_prior, X_obs, U_prior, U_obs):
     U_post = U_prior - Wi.dot(U_prior)
     return X_post, U_post
 
-def compare_depth_maps(tgt_folder, depth_map_folder, pipeline_depth_map_names, flag = "raw"):
+def compare_depth_maps(tgt_folder, depth_map_folder, pipeline_depth_map_names, points_fused_counters, points_new_counters, flag = "raw"):
     if flag == "raw":
         stats_file = os.path.join(args.output_path, "evaluation_raw_depth_maps.txt")
     else:
@@ -249,14 +230,17 @@ def compare_depth_maps(tgt_folder, depth_map_folder, pipeline_depth_map_names, f
     total_both_no_zeros_pixels = 0
 
     for i in tqdm(range(len(pipeline_depth_map_names)), desc="Loading and comparing raw depth maps", unit="depth maps"):
-        depth_name = pipeline_depth_map_names[i]
-        gt_depth_name = "gt_" + depth_name
+        depth_name = pipeline_depth_map_names[i][-6:]
+        gt_depth_name = "gt_depth_" + depth_name
         gt_depth_map_path = tgt_folder + gt_depth_name + '.pfm'
         # depth maps
         gt_depth_map, _ = read_pfm_depth_maps(gt_depth_map_path, isKitti2=True)
 
         pipline_depth_map_path = depth_map_folder + pipeline_depth_map_names[i] + '.pfm'
-        pipeline_depth_map, _ = read_pfm_depth_maps(pipline_depth_map_path, isKitti2=True)
+        if flag is "raw":
+            pipeline_depth_map, _ = read_pfm_depth_maps(pipline_depth_map_path, isKitti2=True)
+        else:
+            pipeline_depth_map, _ = read_pfm_depth_maps(pipline_depth_map_path, isKitti2=False)
 
         both_non_zeros = (pipeline_depth_map != 0) & (gt_depth_map != 0)
         both_zeros = (pipeline_depth_map == 0) & (gt_depth_map == 0)
@@ -281,6 +265,8 @@ def compare_depth_maps(tgt_folder, depth_map_folder, pipeline_depth_map_names, f
             f.write("MAE: {0} over {1} pixels \n".format(maes[i], num_pixels[i]))
             f.write("Median of error: {0} over {1} pixels \n".format(medians[i], num_pixels[i]))
             weighted_average_mae += (maes[i] * (num_pixels[i] / total_both_no_zeros_pixels))
+            if flag is not "raw":
+                f.write("There are {0} points are fused and {1} points are new\n".format(points_fused_counters[i], points_new_counters[i]))
             f.write(
                 "=====================================================================================================\n")
         f.write("Minimum MAE: {0}, Median Medians: {1}, weighted average of MAE {2}, Maximum MAE: {3}\n".format(
@@ -308,13 +294,16 @@ if __name__ == "__main__":
 
     prev_map = []
     prev_uncertainties = []
-
+    points_fused_counters = []
+    points_new_counters = []
     pipeline_depth_map_names = pipeline_depth_map_names[0:5]
     for i in tqdm(range(0, len(pipeline_depth_map_names)), desc="Start to depth fusion & a build map", unit="depth maps"):
         pipline_depth_map_path = pipeline_depth_map_paths[i]
         pipeline_depth_map, shape = read_pfm_depth_maps(pipline_depth_map_path, isKitti2=True)
-        frame_id = pipeline_depth_map_names[i][6:]
+        frame_id = pipeline_depth_map_names[i][-6:]
         pose = img_name_SE3[frame_id]
+        points_fused_counter = 0
+        points_new_counter = 0
 
         height, width = shape[0], shape[1]
         if i == 0:
@@ -323,6 +312,7 @@ if __name__ == "__main__":
                     depth = pipeline_depth_map[v, u]
                     if depth <= 0:
                         continue
+                    points_new_counter += 1
                     X_obs = iproj(pose, K, u, v, depth)
                     prev_map.append(X_obs)
                     U_obs = computeU(u, v, depth, K, baseline, pose)
@@ -337,7 +327,6 @@ if __name__ == "__main__":
                 depth_obs = pipeline_depth_map[v_proj, u_proj]
                 if depth_obs <= 0 or visited[v_proj, u_proj]:
                     continue
-
 
                 # bf = K[0, 0] * baseline
                 # sigma_d = 0.5
@@ -356,10 +345,22 @@ if __name__ == "__main__":
                 max_eigenval = np.real(lamda[0][index])
 
                 dist = np.linalg.norm(X_obs-X_prior)
-                if dist > np.sqrt(max_eigenval):
-                    continue
+                th = np.sqrt(max_eigenval)
+                #
+                # fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+                # Rcw, tcw = pose[0], pose[1]
+                # Xc = Rcw.dot(X_prior) + tcw
+                #
+                # Zci = Xc[2]
+                # support_ratio = 0.04
 
+                if dist > th:
+                    continue
+                # epsilon = support_ratio * depth_obs
+                # if abs(depth_obs - Zci) > epsilon:
+                #     continue
                 visited[v_proj, u_proj] = True
+                points_fused_counter += 1
                 # Update by Kalman filter
                 X_post, U_post = kf_depth_fusion(X_prior, X_obs, U_prior, U_obs)
                 depth_post = getDepth(pose, K, X_post)
@@ -368,13 +369,14 @@ if __name__ == "__main__":
                 # update 3D position and uncertainty
                 cur_map.append(X_post)
                 cur_uncertainties.append(U_post)
+
             # add rest of pixel's 3D position into map
             for v in range(0, height):
                 for u in range(0, width):
                     depth_obs = pipeline_depth_map[v, u]
                     if visited[v, u] or depth_obs <= 0:
                         continue
-
+                    points_new_counter += 1
                     X_obs = iproj(pose, K, u, v, depth_obs)
                     U_obs = computeU(u, v, depth_obs, K, baseline, pose)
                     cur_map.append(X_obs)
@@ -382,6 +384,8 @@ if __name__ == "__main__":
 
             prev_map = cur_map
             prev_uncertainties = cur_uncertainties
+        points_fused_counters.append(points_fused_counter)
+        points_new_counters.append(points_new_counter)
 
         save_path = args.output_path + "kf_depth_maps/" + pipeline_depth_map_names[i] + ".pfm"
         write_depth_map(pipeline_depth_map, save_path)
@@ -389,9 +393,9 @@ if __name__ == "__main__":
     # # print("Complete depth map {0}:{1}".format(i, pipeline_depth_map_names[i]))
 
     # Evaluate depth maps
-    compare_depth_maps(args.gt_folder, args.src_folder, pipeline_depth_map_names)
-    # fused_depth_folder = args.output_path + "kf_depth_maps/"
-    # compare_depth_maps(args.gt_folder, fused_depth_folder, pipeline_depth_map_names, "fused")
+    compare_depth_maps(args.gt_folder, args.src_folder, pipeline_depth_map_names, points_fused_counters, points_new_counters)
+    fused_depth_folder = args.output_path + "kf_depth_maps/"
+    compare_depth_maps(args.gt_folder, fused_depth_folder, pipeline_depth_map_names, points_fused_counters, points_new_counters, "fused")
 
     # Pass global_map to Open3D.o3d.geometry.PointCloud and visualize
     # pcd = o3d.geometry.PointCloud()
