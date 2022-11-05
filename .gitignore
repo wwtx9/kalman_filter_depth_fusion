@@ -1,2 +1,6 @@
 .idea/
 .vscode/
+map.py
+compare.py
+test_seq.py
+__pycache__/

@@ -14,6 +14,7 @@ from numba import jit
 import cv2
 import util_io
 import multiprocessing as mp
+
 def check_rigid(path, curFrameId):
     f = open(path, "r")
     lines = f.readlines()
@@ -207,6 +208,15 @@ def compare_depth_maps(start_ID, args, pipeline_depth_map_names, points_fused_co
             global_min_mae, np.median(medians), weighted_average_mae, global_max_mae))
     f.close()
 
+def compute_observation(v, u, K, sigma_z, pose, depth_obs):
+    X_obs = iproj(pose, K, u, v, depth_obs)
+    U_obs = computeU(u, v ,depth_obs, K, sigma_z, pose)
+    return (X_obs, U_obs)
+
+def call_back_method(res):
+    global cur_map, cur_uncertainties
+    res.append(res[0])
+    cur_uncertainties.append(res[1])
 
 if __name__ == "__main__":
     args = parse_args()
@@ -274,22 +284,19 @@ if __name__ == "__main__":
         points_new_counter = 0
 
         if i == start_ID:
+            pool = mp.Pool(mp.cpu_count())
             for v in range(0, height):
                 for u in range(0, width):
                     depth_obs = np.float64(pipeline_depth_map[v, u])
                     if depth_obs <= 0:
                         continue
-                    if any((lower1 <= u <= upper1) and (lower2 <= v <= upper2) for (lower1, upper1, lower2, upper2) in
-                           boundingboxs):
+                    if any((lower1 <= u <= upper1) and (lower2 <= v <= upper2) for (lower1, upper1, lower2, upper2) in moving_ranges):
                         pipeline_depth_map[v, u] = 0.0
                         continue
-                    points_new_counter += 1
-                    X_obs = iproj(pose, K, u, v, depth_obs)
-                    cur_map.append(X_obs)
-                    z_uncertainty = z_uncertainty_map[v, u]
-                    U_obs = computeU(u, v, depth_obs, K, z_uncertainty, pose)
-                    # U_obs = computeU(u, v, depth, K, baseline, pose)
-                    cur_uncertainties.append(U_obs)
+                    pool.apply_async(compute_observation, args=(v, u, K, baseline, pose, depth_obs),
+                                     callback=call_back_method)
+            pool.close()
+            pool.join()
         else:
             visited = np.zeros((height, width), dtype=bool)
             for (id, u_proj, v_proj, depth_prior) in projFromMap(prev_map, pose, K):
@@ -332,16 +339,11 @@ if __name__ == "__main__":
                 cur_uncertainties.append(U_post)
 
             # add rest of pixel's 3D position into map
+            pool = mp.Pool(mp.cpu_count())
             for v in range(0, height):
                 for u in range(0, width):
                     depth_obs = pipeline_depth_map[v, u]
                     if visited[v, u] or depth_obs <= 0:
-                        continue
-
-                    if any((lower1 <= u <= upper1) and (lower2 <= v <= upper2) for
-                           (lower1, upper1, lower2, upper2) in
-                           boundingboxs):
-                        pipeline_depth_map[v_proj, u_proj] = 0.0
                         continue
 
                     points_new_counter += 1
