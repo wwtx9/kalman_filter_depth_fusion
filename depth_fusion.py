@@ -123,9 +123,9 @@ def kf_depth_fusion(X_prior, X_obs, U_prior, U_obs):
 
 def compare_depth_maps(start_ID, args, pipeline_depth_map_names, points_fused_counters, points_new_counters, flag = "raw"):
     if flag == "raw":
-        stats_file = os.path.join(args.output_path, "evaluation_raw_depth_maps.txt")
+        stats_file = os.path.join(args.output_path, "statistics/evaluation_raw_depth_maps.txt")
     else:
-        stats_file = os.path.join(args.output_path, "evaluation_fused_depth_maps.txt")
+        stats_file = os.path.join(args.output_path, "statistics/evaluation_fused_depth_maps.txt")
 
     global_min_mae = 100.0
     global_max_mae = 0.0
@@ -134,7 +134,7 @@ def compare_depth_maps(start_ID, args, pipeline_depth_map_names, points_fused_co
     num_pixels = []
     total_both_valid_pixels = 0
     max_depth = K[0, 0] * baseline
-    n_frames = len(pipeline_depth_map_names)
+    n_frames = 182 #len(pipeline_depth_map_names)
 
     for i in tqdm(range(start_ID, n_frames), desc="Loading and comparing raw depth maps", unit="depth maps"):
         depth_name = pipeline_depth_map_names[i][-6:]
@@ -237,7 +237,7 @@ if __name__ == "__main__":
     boundbox_path = args.bbox_path
     max_depth = K[0, 0] * baseline
     start_ID = 179
-    n_frames = len(pipeline_depth_map_names)
+    n_frames = 182 #len(pipeline_depth_map_names)
     for i in tqdm(range(start_ID, n_frames), desc="Start to depth fusion & a build map",
                   unit="depth maps"):
         # depth map path
@@ -341,7 +341,7 @@ if __name__ == "__main__":
                     if any((lower1 <= u <= upper1) and (lower2 <= v <= upper2) for
                            (lower1, upper1, lower2, upper2) in
                            boundingboxs):
-                        pipeline_depth_map[v_proj, u_proj] = 0.0
+                        pipeline_depth_map[v, u] = 0.0
                         continue
 
                     points_new_counter += 1

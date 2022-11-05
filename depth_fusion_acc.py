@@ -210,12 +210,12 @@ def compare_depth_maps(start_ID, args, pipeline_depth_map_names, points_fused_co
 
 def compute_observation(v, u, K, sigma_z, pose, depth_obs):
     X_obs = iproj(pose, K, u, v, depth_obs)
-    U_obs = computeU(u, v ,depth_obs, K, sigma_z, pose)
+    U_obs = computeU(u, v, depth_obs, K, sigma_z, pose)
     return (X_obs, U_obs)
 
 def call_back_method(res):
     global cur_map, cur_uncertainties
-    res.append(res[0])
+    cur_map.append(res[0])
     cur_uncertainties.append(res[1])
 
 if __name__ == "__main__":
@@ -290,10 +290,11 @@ if __name__ == "__main__":
                     depth_obs = np.float64(pipeline_depth_map[v, u])
                     if depth_obs <= 0:
                         continue
-                    if any((lower1 <= u <= upper1) and (lower2 <= v <= upper2) for (lower1, upper1, lower2, upper2) in moving_ranges):
+                    if any((lower1 <= u <= upper1) and (lower2 <= v <= upper2) for (lower1, upper1, lower2, upper2) in boundingboxs):
                         pipeline_depth_map[v, u] = 0.0
                         continue
-                    pool.apply_async(compute_observation, args=(v, u, K, baseline, pose, depth_obs),
+                    z_uncertainty = z_uncertainty_map[v, u]
+                    pool.apply_async(compute_observation, args=(v, u, K, z_uncertainty, pose, depth_obs),
                                      callback=call_back_method)
             pool.close()
             pool.join()
@@ -345,14 +346,17 @@ if __name__ == "__main__":
                     depth_obs = pipeline_depth_map[v, u]
                     if visited[v, u] or depth_obs <= 0:
                         continue
+                    if any((lower1 <= u <= upper1) and (lower2 <= v <= upper2) for
+                           (lower1, upper1, lower2, upper2) in
+                           boundingboxs):
+                        pipeline_depth_map[v, u] = 0.0
+                        continue
 
-                    points_new_counter += 1
-                    X_obs = iproj(pose, K, u, v, depth_obs)
                     z_uncertainty = z_uncertainty_map[v, u]
-                    U_obs = computeU(u, v, depth_obs, K, z_uncertainty, pose)
-                    # U_obs = computeU(u, v, depth_obs, K, baseline, pose)
-                    cur_map.append(X_obs)
-                    cur_uncertainties.append(U_obs)
+                    pool.apply_async(compute_observation, args=(v, u, K, z_uncertainty, pose, depth_obs),
+                                     callback=call_back_method)
+            pool.close()
+            pool.join()
 
         prev_map = cur_map
         prev_uncertainties = cur_uncertainties
