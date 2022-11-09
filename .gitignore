@@ -3,4 +3,6 @@
 map.py
 compare.py
 test_seq.py
+test_stereo.py
+log_file
 __pycache__/
